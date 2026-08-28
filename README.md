@@ -75,10 +75,6 @@ When neither `--json` nor `--csv` is specified, both files are created automatic
 
 The CSV is written with UTF-8 BOM (`utf-8-sig`) for compatibility with Excel.
 
-## Architecture & Security
-
-See [Architecture.md](Architecture.md), [Security.md](Security.md), and [SBOM.md](SBOM.md).
-
 ## Known Limitations & Assumptions
 
 - `--json` and `--csv` flags are silently ignored when fetching multiple versions; per-version auto-named files are produced instead.
