@@ -23,9 +23,6 @@ git clone <repository-url>
 cd eits
 python fetch_eits.py --help
 ```
-
-A virtual environment is included (`pyvenv.cfg`) but is not required since the script has no external dependencies.
-
 ## Running the Application
 
 ```bash
