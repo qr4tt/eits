@@ -1,14 +1,1 @@
-# E-ITS fetcher — runtime dependencies
-#
-# Requires Python 3.13 (developed against 3.13.12).
-#
-# This project has NO third-party runtime dependencies. fetch_eits.py uses only
-# the CPython standard library: argparse, concurrent.futures, csv, html,
-# html.parser, json, sys, time, urllib.request.
-#
-# The file is kept (intentionally empty of packages) so that tooling and CI
-# steps that expect a manifest — `pip install -r requirements.txt`, pip-audit,
-# SBOM scanners — resolve cleanly. See SBOM.md for the full component inventory.
-#
-# Install with:
-#   python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
