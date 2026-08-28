@@ -4,6 +4,7 @@
 import csv
 import html
 import json
+import re
 import sys
 import time
 import argparse
@@ -11,17 +12,35 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 
+_BLOCK_TAGS = {"p", "div", "li", "tr", "br", "h1", "h2", "h3", "h4", "h5", "h6"}
+
 
 class _Stripper(HTMLParser):
+    """Flatten HTML to text, one line per block element."""
+
     def __init__(self):
         super().__init__()
-        self._parts = []
+        self._lines = [[]]
+
+    def _break(self):
+        if self._lines[-1]:
+            self._lines.append([])
+
+    def handle_starttag(self, tag, attrs):
+        if tag in _BLOCK_TAGS:
+            self._break()
+
+    def handle_endtag(self, tag):
+        if tag in _BLOCK_TAGS:
+            self._break()
 
     def handle_data(self, data):
-        self._parts.append(data)
+        text = data.replace("\xa0", " ").strip()
+        if text:
+            self._lines[-1].append(text)
 
     def get_text(self):
-        return " ".join(self._parts).strip()
+        return "\n".join(" ".join(parts) for parts in self._lines if parts)
 
 
 def strip_html(raw):
@@ -29,8 +48,63 @@ def strip_html(raw):
     s.feed(html.unescape(raw or ""))
     return s.get_text()
 
+
+# The measure body starts with a block of "<p><b>Label:</b> value</p>" paragraphs
+# that repeat metadata rather than requirements; these are lifted into own columns.
+_META_PARA = re.compile(r"\s*<p>\s*<b>\s*([^<]+?)\s*:?\s*</b>\s*(.*?)\s*</p>", re.S | re.I)
+_META_FIELDS = {
+    "vastutaja": "responsible",
+    "responsible": "responsible",
+    "elutsükli etapp": "lifecycle_stage",
+    "life cycle phase": "lifecycle_stage",
+    "lifecycle phase": "lifecycle_stage",
+    "turvakomponent": "security_component",
+    "security component": "security_component",
+}
+
+
+def split_body_meta(raw):
+    """Return (metadata dict, remaining body HTML) for a measure body."""
+    body = raw or ""
+    meta = {}
+    while True:
+        m = _META_PARA.match(body)
+        if not m:
+            break
+        field = _META_FIELDS.get(strip_html(m.group(1)).lower())
+        if not field:
+            # Unknown label: leave it in the body rather than dropping it.
+            break
+        meta[field] = strip_html(m.group(2))
+        body = body[m.end():]
+    return meta, body
+
+
+# Requirements inside a measure body are lettered paragraphs ("a. ...", "b. ...");
+# any following lines (list bullets, continuations) belong to the preceding letter.
+_SUBMEASURE = re.compile(r"^([a-z])\.\s+(.*)$")
+
+
+def split_submeasures(text):
+    """Return [(letter, text)] for a stripped measure body.
+
+    Text before the first lettered paragraph — rare, but possible — is returned
+    under an empty letter so nothing is dropped.
+    """
+    items = []
+    for line in text.split("\n"):
+        m = _SUBMEASURE.match(line)
+        # Letters always run forward; a "b." inside a bullet list is continuation text.
+        if m and (not items or m.group(1) > items[-1][0]):
+            items.append([m.group(1), [m.group(2)]])
+        elif items:
+            items[-1][1].append(line)
+        elif line.strip():
+            items.append(["", [line]])
+    return [(letter, "\n".join(parts)) for letter, parts in items]
+
 BASE_URL = "https://eits.ria.ee/api/2"
-DEFAULT_VERSION = "2025"
+DEFAULT_VERSION = "2026"
 
 
 def get(path, params=None):
@@ -96,42 +170,65 @@ def save_json(data, path):
     print(f"JSON saved to {path}")
 
 
-def save_csv(data, path):
+def strip_code_prefix(title, code):
+    """Drop a leading measure/module code (and its separator) from a title."""
+    if code and title.startswith(code):
+        return title[len(code):].lstrip(": ").strip()
+    return title
+
+
+def save_csv(data, path, per_submeasure=True):
     rows = []
     for mod in data["modules"].values():
         if "error" in mod:
             continue
-        module_id = mod.get("moduleId", "")
         module_code = mod.get("moduleCode", "")
-        module_title = mod.get("moduleTitle", "")
+        module_title = strip_code_prefix(mod.get("moduleTitle", ""), module_code)
         for group in mod.get("measureDetails", []):
             group_code = group.get("groupCode", "")
             group_title = group.get("groupTitle", "")
             for measure in group.get("measures", []):
-                rows.append({
-                    "module_id": module_id,
+                meta, body = split_body_meta(measure.get("body", ""))
+                text = strip_html(body)
+                measure_code = measure.get("measureCode", "")
+                row = {
                     "module_code": module_code,
                     "module_title": module_title,
                     "group_code": group_code,
                     "group_title": group_title,
-                    "measure_id": measure.get("measureId", ""),
-                    "measure_code": measure.get("measureCode", ""),
-                    "measure_title": measure.get("measureTitle", ""),
-                    "measure_body": strip_html(measure.get("body", "")),
+                    "measure_code": measure_code,
+                    "measure_title": strip_code_prefix(
+                        measure.get("measureTitle", ""), measure_code),
+                    "responsible": meta.get("responsible", ""),
+                    "lifecycle_stage": meta.get("lifecycle_stage", ""),
+                    "security_component": meta.get("security_component", ""),
                     "assignees": "; ".join(measure.get("assignees", [])),
-                    "security_codes": "; ".join(measure.get("securityCodes", [])),
-                })
+                }
+                if not per_submeasure:
+                    rows.append({**row, "measure_body": text})
+                    continue
+                for letter, sub_text in split_submeasures(text) or [("", "")]:
+                    rows.append({
+                        **row,
+                        "submeasure_code": f"{measure_code}.{letter}" if letter else measure_code,
+                        "submeasure_body": sub_text,
+                    })
 
+    body_fields = (["submeasure_code", "submeasure_body"]
+                   if per_submeasure else ["measure_body"])
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "module_id", "module_code", "module_title",
+        writer = csv.DictWriter(f, delimiter=";", fieldnames=[
+            "module_code", "module_title",
             "group_code", "group_title",
-            "measure_id", "measure_code", "measure_title", "measure_body",
-            "assignees", "security_codes",
+            "measure_code", "measure_title",
+            "responsible", "lifecycle_stage", "security_component",
+            *body_fields,
+            "assignees",
         ])
         writer.writeheader()
         writer.writerows(rows)
-    print(f"CSV saved to {path} ({len(rows)} measures)")
+    unit = "submeasures" if per_submeasure else "measures"
+    print(f"CSV saved to {path} ({len(rows)} {unit})")
 
 
 def main():
@@ -139,9 +236,9 @@ def main():
         description="Fetch E-ITS modules and measures",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-               "  %(prog)s                          # fetch 2025\n"
+               "  %(prog)s                          # fetch 2026\n"
                "  %(prog)s --version 2024           # fetch 2024\n"
-               "  %(prog)s --version 2023 2024 2025 # fetch multiple versions\n"
+               "  %(prog)s --version 2023 2024 2026 # fetch multiple versions\n"
                "  %(prog)s --all-versions           # fetch all available versions\n",
     )
     parser.add_argument(
@@ -154,6 +251,8 @@ def main():
                         help="Save full data as JSON (only valid for a single version)")
     parser.add_argument("--csv", dest="csv_output", metavar="FILE",
                         help="Save measures as CSV (only valid for a single version)")
+    parser.add_argument("--csv-rows", choices=["submeasure", "measure"], default="submeasure",
+                        help="CSV granularity: one row per lettered submeasure (default) or per measure")
     parser.add_argument("--list-versions", action="store_true", help="List available versions and exit")
     parser.add_argument("--workers", type=int, default=8, help="Concurrent requests (default: 8)")
     parser.add_argument("--delay", type=float, default=0.05, help="Delay between requests in seconds (default: 0.05)")
@@ -197,7 +296,7 @@ def main():
         if json_path:
             save_json(data, json_path)
         if csv_path:
-            save_csv(data, csv_path)
+            save_csv(data, csv_path, per_submeasure=args.csv_rows == "submeasure")
 
 
 if __name__ == "__main__":
